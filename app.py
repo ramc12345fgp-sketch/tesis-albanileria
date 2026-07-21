@@ -1,0 +1,454 @@
+import streamlit as st
+import math
+import pandas as pd
+import numpy as np
+import io
+import tempfile
+import os
+
+try:
+    import ezdxf
+    EXDXF_DISPONIBLE = True
+except ImportError:
+    EXDXF_DISPONIBLE = False
+
+# --- Funciones Matematicas para Geometria CAD ---
+def poly_area_centroid(pts):
+    if not pts: return 0, 0, 0
+    p = list(pts)
+    if p[0] != p[-1]: 
+        p.append(p[0])
+    area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for i in range(len(p)-1):
+        x0, y0 = p[i][0], p[i][1]
+        x1, y1 = p[i+1][0], p[i+1][1]
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    area = area / 2.0
+    if area != 0:
+        cx = cx / (6.0 * area)
+        cy = cy / (6.0 * area)
+    return abs(area), cx, cy
+
+# -----------------------------------------
+# CONFIGURACION DE PAGINA Y ESTILOS GLOBALES
+# -----------------------------------------
+st.set_page_config(page_title="Diseno de Albanileria", layout="wide")
+
+st.markdown("""
+    <style>
+    .main {background-color: #f4f6f9;}
+    h1, h2, h3 {color: #1e3d59;}
+    .resultado-caja {
+        background-color: #e3f2fd; padding: 15px; border-radius: 8px; border-left: 5px solid #1976d2; margin-top: 20px; margin-bottom: 20px;
+    }
+    table.dataframe th {
+        background-color: #002b36 !important; color: white !important; border: 1px dashed white !important; text-align: center !important;
+    }
+    
+    /* ESTILOS PARA RESALTAR INPUTS EDITABLES */
+    div[data-testid="stNumberInput"] input,
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stSelectbox"] div[class*="ValueContainer"] {
+        color: #0000cd !important; /* Azul oscuro */
+        font-weight: 900 !important;
+        background-color: #e6f2ff !important;
+        border-radius: 4px;
+    }
+    
+    /* MODO OSCURO */
+    @media (prefers-color-scheme: dark) {
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stSelectbox"] div[class*="ValueContainer"] {
+            color: #00ffff !important; /* Celeste brillante */
+            font-weight: 900 !important;
+            background-color: #0d2a45 !important;
+        }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("DISENO ESTRUCTURAL DE ALBANILERIA CONFINADA")
+st.markdown("---")
+
+# -----------------------------------------
+# INICIALIZACION DE LA MEMORIA (SESSION STATE)
+# -----------------------------------------
+if "muros_x" not in st.session_state:
+    st.session_state.muros_x = {i: pd.DataFrame(columns=["ITEM", "L(m)", "t=e(m)", "X(m)", "Y(m)"]) for i in range(1, 11)}
+    st.session_state.muros_y = {i: pd.DataFrame(columns=["ITEM", "L(m)", "t=e(m)", "X(m)", "Y(m)"]) for i in range(1, 11)}
+    st.session_state.espesor_general = {i: 0.23 for i in range(1, 11)}
+    st.session_state.losa_area = 614.0
+    st.session_state.losa_cx = 13.50
+    st.session_state.losa_cy = 13.50
+
+tab1, tab2, tab3 = st.tabs(["PARTE I: Materiales y Sismo", "PARTE II: Geometria y Densidad", "PARTE III: Centro de Masa y Pesos"])
+
+# =========================================
+# TAB 1: CONDICIONES DE ESTRUCTURACION
+# =========================================
+with tab1:
+    st.subheader("1. CONDICIONES DE ESTRUCTURACION Y MATERIALES")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.write("#### Albanileria (Ladrillo y Mortero)")
+        fm = st.number_input("Resistencia a compresion f'm (kg/cm2)", value=65.0, step=1.0)
+        vm = st.number_input("Resistencia al corte v'm (kg/cm2)", value=8.1, step=0.1)
+        fb = st.number_input("Resistencia del ladrillo f'b (kg/cm2)", value=130.0, step=1.0)
+        espesor = st.number_input("Espesor del muro 't' (cm)", value=15.0, step=1.0)
+    with col2:
+        st.write("#### Concreto")
+        fc = st.number_input("Resistencia Nominal f'c (kg/cm2)", value=175.0, step=1.0)
+    with col3:
+        st.write("#### Acero Corrugado")
+        fy = st.number_input("Fluencia fy (kg/cm2)", value=4200.0, step=100.0)
+
+    st.markdown("---")
+    Em = 500 * fm
+    Gm = 0.4 * Em
+    Ec = 15000 * math.sqrt(fc)
+
+    st.write("### Parametros Calculados")
+    st.markdown(f"""
+    <div class="resultado-caja">
+        <b>Modulo de Elasticidad de la Albanileria (Em):</b> {Em:,.2f} kg/cm2 <br>
+        <b>Modulo de Corte de la Albanileria (Gm):</b> {Gm:,.2f} kg/cm2 <br>
+        <b>Modulo de Elasticidad del Concreto (Ec):</b> {Ec:,.2f} kg/cm2
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.subheader("2. PARAMETROS SISMICOS (NORMA E.030)")
+    st.info("Estos parametros seran almacenados y utilizados posteriormente en el Calculo de Cortante Basal y Fuerzas Inerciales.")
+    
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+
+    with col_s1:
+        st.write("**Factores de Sitio**")
+        st.session_state.zona_z = st.selectbox("Zona Sismica (Z)", ["Z4", "Z3", "Z2", "Z1"], index=0)
+        st.session_state.uso_u = st.selectbox("Categoria de Edificacion (U)", ["A", "B", "C"], index=2)
+        st.session_state.suelo_s = st.selectbox("Perfil de Suelo (S)", ["S0", "S1", "S2", "S3"], index=2)
+
+    with col_s2:
+        st.write("**Periodo y Reduccion**")
+        st.session_state.coef_ct = st.number_input("Coeficiente CT", value=60.0, step=5.0)
+        st.session_state.r0 = st.number_input("Coeficiente Basico Reduccion (R0)", value=6.0, step=0.5)
+
+    with col_s3:
+        st.write("**Irregularidades**")
+        st.session_state.ia = st.number_input("Irregularidad en Altura (Ia)", value=1.00, step=0.05)
+        st.session_state.ip = st.number_input("Irregularidad en Planta (Ip)", value=0.90, step=0.05)
+
+    with col_s4:
+        st.write("**Otros Datos**")
+        st.session_state.hm = st.number_input("Altura Total HM (m)", value=13.5, step=0.5)
+
+# =========================================
+# TAB 2: GEOMETRIA Y DENSIDAD
+# =========================================
+with tab2:
+    st.subheader("1) Configuracion General del Edificio")
+    col_cfg1, col_cfg2 = st.columns(2)
+    with col_cfg1:
+        num_niveles = st.number_input("Numero Total de Niveles", min_value=1, max_value=10, value=5)
+    with col_cfg2:
+        modo = st.radio("Modo de Distribucion de Muros en Planta", ["Misma Distribucion (Tipica)", "Distribucion Diferente por Nivel"])
+
+    st.markdown("---")
+    st.subheader("2) Base de Datos de Muros")
+    
+    nivel_actual = st.selectbox("Seleccione el Nivel a visualizar / editar:", range(1, int(num_niveles) + 1))
+    metodo_ingreso = st.radio("Metodo de ingreso de geometria:", ["Importar desde Plano CAD (DXF)", "Manual / Excel"], horizontal=True)
+    
+    bloquear_tablas = False
+    
+    if modo == "Misma Distribucion (Tipica)" and nivel_actual > 1:
+        st.info(f"El Nivel {nivel_actual} copia la geometria base. Puedes ajustar un espesor general:")
+        bloquear_tablas = True 
+        nuevo_t = st.number_input(f"Espesor general para Nivel {nivel_actual} (m):", min_value=0.05, max_value=0.50, value=float(st.session_state.espesor_general[nivel_actual]), step=0.01)
+        if st.session_state.espesor_general[nivel_actual] != nuevo_t:
+            st.session_state.espesor_general[nivel_actual] = nuevo_t
+            st.rerun() 
+
+    # --- LOGICA DE IMPORTACION CAD (DXF) ---
+    if metodo_ingreso == "Importar desde Plano CAD (DXF)" and not bloquear_tablas:
+        if not EXDXF_DISPONIBLE:
+            st.error("La libreria 'ezdxf' no esta instalada. Ejecute 'pip install ezdxf' en su terminal.")
+        else:
+            archivo_dxf = st.file_uploader(f"Cargar plano DXF (Nivel {nivel_actual})", type=["dxf"], key=f"dxf_{nivel_actual}")
+            
+            if archivo_dxf is not None:
+                if st.button("Procesar Geometria DXF", key=f"btn_dxf_{nivel_actual}"):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
+                        tmp_file.write(archivo_dxf.getvalue())
+                        tmp_path = tmp_file.name
+                        
+                    try:
+                        doc = ezdxf.readfile(tmp_path)
+                        msp = doc.modelspace()
+                        
+                        muros_raw, losa_raw, cols_raw = [], [], []
+                        min_x, min_y = float('inf'), float('inf')
+                        
+                        for entity in msp:
+                            if entity.dxftype() == 'LWPOLYLINE':
+                                layer = entity.dxf.layer.upper()
+                                pts = list(entity.get_points(format='xy'))
+                                
+                                for p in pts:
+                                    if p[0] < min_x: min_x = p[0]
+                                    if p[1] < min_y: min_y = p[1]
+                                    
+                                if layer == 'MURO':
+                                    muros_raw.append(pts)
+                                elif layer == 'LOSA':
+                                    losa_raw.append(pts)
+                                elif layer == 'C_CONFINAMIENTO':
+                                    cols_raw.append(pts)
+                        
+                        if min_x == float('inf'): min_x, min_y = 0.0, 0.0
+                        
+                        st.session_state[f"muros_raw_{nivel_actual}"] = muros_raw
+                        st.session_state[f"losa_raw_{nivel_actual}"] = losa_raw
+                        st.session_state[f"cols_raw_{nivel_actual}"] = cols_raw
+                        st.session_state[f"min_x_{nivel_actual}"] = min_x
+                        st.session_state[f"min_y_{nivel_actual}"] = min_y
+                        
+                    except Exception as e:
+                        st.error(f"Error al procesar el archivo DXF: {e}")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                
+                if f"muros_raw_{nivel_actual}" in st.session_state:
+                    st.write("**Seleccion de Origen (Revisa coordenadas antes de extraer)**")
+                    col_origen1, col_origen2 = st.columns(2)
+                    with col_origen1:
+                        origen_x = st.number_input("Coordenada X del Origen (m)", value=float(st.session_state[f"min_x_{nivel_actual}"]), step=0.1)
+                    with col_origen2:
+                        origen_y = st.number_input("Coordenada Y del Origen (m)", value=float(st.session_state[f"min_y_{nivel_actual}"]), step=0.1)
+                    
+                    if st.button("Confirmar Origen y Extraer Datos de Muros", type="primary"):
+                        muros_x_data, muros_y_data = [], []
+                        idx_x, idx_y = 1, 1
+                        
+                        for pts in st.session_state[f"muros_raw_{nivel_actual}"]:
+                            pts_adj = [(p[0] - origen_x, p[1] - origen_y) for p in pts]
+                            area, cx, cy = poly_area_centroid(pts_adj)
+                            
+                            xs = [p[0] for p in pts_adj]
+                            ys = [p[1] for p in pts_adj]
+                            dx = max(xs) - min(xs)
+                            dy = max(ys) - min(ys)
+                            
+                            if dx >= dy:
+                                muros_x_data.append({"ITEM": f"X{idx_x}", "L(m)": round(dx, 2), "t=e(m)": round(dy, 2), "X(m)": round(cx, 3), "Y(m)": round(cy, 3)})
+                                idx_x += 1
+                            else:
+                                muros_y_data.append({"ITEM": f"Y{idx_y}", "L(m)": round(dy, 2), "t=e(m)": round(dx, 2), "X(m)": round(cx, 3), "Y(m)": round(cy, 3)})
+                                idx_y += 1
+                        
+                        if muros_x_data: st.session_state.muros_x[nivel_actual] = pd.DataFrame(muros_x_data)
+                        if muros_y_data: st.session_state.muros_y[nivel_actual] = pd.DataFrame(muros_y_data)
+                        
+                        if st.session_state[f"losa_raw_{nivel_actual}"]:
+                            losa_adj = [(p[0] - origen_x, p[1] - origen_y) for p in st.session_state[f"losa_raw_{nivel_actual}"][0]]
+                            a_losa, cx_losa, cy_losa = poly_area_centroid(losa_adj)
+                            st.session_state.losa_area = round(a_losa, 2)
+                            st.session_state.losa_cx = round(cx_losa, 3)
+                            st.session_state.losa_cy = round(cy_losa, 3)
+                        
+                        st.success("Datos extraidos correctamente del CAD. Revisa las tablas generadas abajo.")
+
+    # --- LOGICA DE IMPORTACION EXCEL ---
+    elif metodo_ingreso == "Manual / Excel" and not bloquear_tablas and (modo != "Misma Distribucion (Tipica)" or nivel_actual == 1):
+        archivo_subido = st.file_uploader(f"Cargar Excel (Nivel {nivel_actual})", type=["xlsx", "xls"], key=f"up_{nivel_actual}")
+        if archivo_subido is not None:
+            try:
+                df_raw = pd.read_excel(archivo_subido, header=None)
+                fila_headers = -1
+                for index, row in df_raw.iterrows():
+                    if "ITEM" in row.astype(str).str.strip().str.upper().values:
+                        fila_headers = index; break
+                
+                if fila_headers != -1:
+                    row_vals = df_raw.iloc[fila_headers].astype(str).str.strip().str.upper().values
+                    indices_item = [i for i, val in enumerate(row_vals) if val == "ITEM"]
+                    if len(indices_item) >= 1:
+                        col_x_start = indices_item[0]
+                        df_x_ext = df_raw.iloc[fila_headers+1:, col_x_start:col_x_start+5].copy()
+                        df_x_ext.columns = ["ITEM", "L(m)", "t=e(m)", "X(m)", "Y(m)"]
+                        st.session_state.muros_x[nivel_actual] = df_x_ext.dropna(subset=["ITEM", "L(m)"])
+                    if len(indices_item) >= 2:
+                        col_y_start = indices_item[1]
+                        df_y_ext = df_raw.iloc[fila_headers+1:, col_y_start:col_y_start+5].copy()
+                        df_y_ext.columns = ["ITEM", "L(m)", "t=e(m)", "X(m)", "Y(m)"]
+                        st.session_state.muros_y[nivel_actual] = df_y_ext.dropna(subset=["ITEM", "L(m)"])
+                    st.success("Excel cargado correctamente.")
+            except Exception as e:
+                st.error(f"Error al leer: {e}")
+
+    # Mostrar Tablas
+    col_tx, col_ty = st.columns(2)
+    
+    df_x_vista = st.session_state.muros_x[nivel_actual].copy() if modo == "Distribucion Diferente por Nivel" or nivel_actual == 1 else st.session_state.muros_x[1].copy()
+    df_y_vista = st.session_state.muros_y[nivel_actual].copy() if modo == "Distribucion Diferente por Nivel" or nivel_actual == 1 else st.session_state.muros_y[1].copy()
+    
+    if bloquear_tablas:
+        df_x_vista["t=e(m)"] = st.session_state.espesor_general[nivel_actual]
+        df_y_vista["t=e(m)"] = st.session_state.espesor_general[nivel_actual]
+
+    for col in ["L(m)", "t=e(m)", "X(m)", "Y(m)"]:
+        df_x_vista[col] = pd.to_numeric(df_x_vista[col], errors='coerce')
+        df_y_vista[col] = pd.to_numeric(df_y_vista[col], errors='coerce')
+
+    with col_tx:
+        st.write(f"**MUROS DIRECCION X - X (NIVEL {nivel_actual})**")
+        edit_x = st.data_editor(df_x_vista, num_rows="dynamic" if not bloquear_tablas else "fixed", disabled=bloquear_tablas, key=f"tbl_x_{nivel_actual}", width="stretch")
+        if not bloquear_tablas: st.session_state.muros_x[nivel_actual] = edit_x
+
+    with col_ty:
+        st.write(f"**MUROS DIRECCION Y - Y (NIVEL {nivel_actual})**")
+        edit_y = st.data_editor(df_y_vista, num_rows="dynamic" if not bloquear_tablas else "fixed", disabled=bloquear_tablas, key=f"tbl_y_{nivel_actual}", width="stretch")
+        if not bloquear_tablas: st.session_state.muros_y[nivel_actual] = edit_y
+            
+    st.markdown("---")
+    st.subheader("3) Verificacion de Densidad de Muros (Global)")
+    
+    area_construida = st.number_input("Area Construida del Edificio (Ap) [m2]", value=float(st.session_state.losa_area), step=10.0)
+    st.session_state.losa_area = area_construida
+    
+    zusn_56_base = [0.0442, 0.0354, 0.0265, 0.0177, 0.0088, 0.005, 0.005, 0.005, 0.005, 0.005] 
+    verif_data = []
+    for n in range(1, int(num_niveles) + 1):
+        if modo == "Misma Distribucion (Tipica)" and n > 1:
+            df_x_calc, df_y_calc = st.session_state.muros_x[1].copy(), st.session_state.muros_y[1].copy()
+            df_x_calc["t=e(m)"] = st.session_state.espesor_general[n]
+            df_y_calc["t=e(m)"] = st.session_state.espesor_general[n]
+        else:
+            df_x_calc, df_y_calc = st.session_state.muros_x[n].copy(), st.session_state.muros_y[n].copy()
+        
+        area_x = (pd.to_numeric(df_x_calc["L(m)"], errors='coerce') * pd.to_numeric(df_x_calc["t=e(m)"], errors='coerce')).sum()
+        area_y = (pd.to_numeric(df_y_calc["L(m)"], errors='coerce') * pd.to_numeric(df_y_calc["t=e(m)"], errors='coerce')).sum()
+        
+        densidad_x = area_x / area_construida if area_construida > 0 else 0
+        densidad_y = area_y / area_construida if area_construida > 0 else 0
+        
+        zusn_val = zusn_56_base[n-1] if n <= len(zusn_56_base) else 0.005
+        ratio_x = zusn_val / densidad_x if densidad_x > 0 else 0
+        ratio_y = zusn_val / densidad_y if densidad_y > 0 else 0
+        
+        verif_data.append({
+            "Nivel": n, "Area Muros X": area_x, "Area Muros Y": area_y, "Area Const.": area_construida,
+            "∑t*Lx / Ap": densidad_x, "∑t*Ly / Ap": densidad_y, "ZUSN / 56": zusn_val,
+            "Ratio X": ratio_x, "Ratio Y": ratio_y,
+            "Verif. X": "Cumple" if ratio_x <= 1.0 else "No Cumple", "Verif. Y": "Cumple" if ratio_y <= 1.0 else "No Cumple"
+        })
+        
+    df_verificacion = pd.DataFrame(verif_data)
+
+    def color_ratio(val):
+        if pd.isna(val): return ''
+        if val >= 1.0: return 'background-color: #ef5350; color: white; font-weight: bold;'
+        elif val >= 0.7: return 'background-color: #ff9800; color: white; font-weight: bold;'
+        elif val >= 0.5: return 'background-color: #ffee58; color: black; font-weight: bold;'
+        else: return 'background-color: #81c784; color: black; font-weight: bold;'
+
+    def color_cumple(val):
+        if val == "Cumple": return 'background-color: #c8e6c9; color: #1b5e20; font-style: italic;'
+        else: return 'background-color: #ffcdd2; color: #b71c1c; font-style: italic;'
+
+    styled_df = (df_verificacion.style
+                 .map(color_ratio, subset=['Ratio X', 'Ratio Y'])
+                 .map(color_cumple, subset=['Verif. X', 'Verif. Y'])
+                 .format({'Area Muros X': '{:.2f}', 'Area Muros Y': '{:.2f}', 'Area Const.': '{:.2f}', '∑t*Lx / Ap': '{:.4f}', '∑t*Ly / Ap': '{:.4f}', 'ZUSN / 56': '{:.4f}', 'Ratio X': '{:.2%}', 'Ratio Y': '{:.2%}'}))
+    st.dataframe(styled_df, width="stretch", hide_index=True)
+
+# =========================================
+# TAB 3: CENTRO DE MASA Y PESO SISMICO
+# =========================================
+with tab3:
+    st.subheader("1) Parametros de Cargas Unitarias y Centroides")
+    col_cm1, col_cm2, col_cm3 = st.columns(3)
+    with col_cm1:
+        st.write("**Cargas Muertas (CM)**")
+        p_muro = st.number_input("Peso Especifico Muro (ton/m3)", value=1.80, step=0.10)
+        p_losa = st.number_input("Peso Especifico Losa (ton/m2)", value=0.30, step=0.05)
+        p_acabados = st.number_input("Peso Acabados (ton/m2)", value=0.10, step=0.05)
+        p_piso = st.number_input("Peso Piso Terminado (ton/m2)", value=0.10, step=0.05)
+    with col_cm2:
+        st.write("**Cargas Vivas (CV)**")
+        cv_tipico = st.number_input("Sobrecarga Vivienda (ton/m2)", value=0.20, step=0.05)
+        cv_azotea = st.number_input("Sobrecarga Azotea (ton/m2)", value=0.10, step=0.05)
+        categoria = st.selectbox("Categoria Edificacion", ["C (25% CV)", "A o B (50% CV)"], key="cat_cm")
+    with col_cm3:
+        st.write("**Centroide de Losa (Obtenido del CAD/Manual)**")
+        xlosa = st.number_input("Centro Losa Xi (m)", value=float(st.session_state.losa_cx), step=0.5)
+        ylosa = st.number_input("Centro Losa Yi (m)", value=float(st.session_state.losa_cy), step=0.5)
+
+    st.markdown("---")
+    st.subheader("2) Resumen: Centro de Masa Por Piso")
+    
+    porcentaje_sismo = 0.25 if "C" in categoria else 0.50
+    data_cm = []
+    data_pesos = []
+    altura_piso = 2.5
+    
+    for n in range(1, int(num_niveles) + 1):
+        if modo == "Misma Distribucion (Tipica)" and n > 1:
+            df_x_calc, df_y_calc = st.session_state.muros_x[1].copy(), st.session_state.muros_y[1].copy()
+            df_x_calc["t=e(m)"] = st.session_state.espesor_general[n]
+            df_y_calc["t=e(m)"] = st.session_state.espesor_general[n]
+        else:
+            df_x_calc, df_y_calc = st.session_state.muros_x[n].copy(), st.session_state.muros_y[n].copy()
+            
+        for col in ["L(m)", "t=e(m)", "X(m)", "Y(m)"]:
+            df_x_calc[col] = pd.to_numeric(df_x_calc[col], errors='coerce').fillna(0)
+            df_y_calc[col] = pd.to_numeric(df_y_calc[col], errors='coerce').fillna(0)
+            
+        peso_mx = df_x_calc["L(m)"] * df_x_calc["t=e(m)"] * altura_piso * p_muro
+        peso_my = df_y_calc["L(m)"] * df_y_calc["t=e(m)"] * altura_piso * p_muro
+        
+        px_mx, py_mx = peso_mx * df_x_calc["X(m)"], peso_mx * df_x_calc["Y(m)"]
+        px_my, py_my = peso_my * df_y_calc["X(m)"], peso_my * df_y_calc["Y(m)"]
+        
+        peso_muros_total = peso_mx.sum() + peso_my.sum()
+        px_muros_total = px_mx.sum() + px_my.sum()
+        py_muros_total = py_mx.sum() + py_my.sum()
+        
+        peso_losa_total = area_construida * p_losa
+        px_losa_tot = peso_losa_total * xlosa
+        py_losa_tot = peso_losa_total * ylosa
+        
+        peso_cm_piso = peso_muros_total + peso_losa_total
+        px_total = px_muros_total + px_losa_tot
+        py_total = py_muros_total + py_losa_tot
+        
+        cm_x = px_total / peso_cm_piso if peso_cm_piso > 0 else 0
+        cm_y = py_total / peso_cm_piso if peso_cm_piso > 0 else 0
+        
+        data_cm.append({"Nivel": n, "Peso Total (t)": peso_cm_piso, "Px": px_total, "Py": py_total, "CMx": cm_x, "CMy": cm_y})
+        
+        cm_muerta = peso_cm_piso + (area_construida * p_acabados) + (area_construida * p_piso)
+        cv_piso = area_construida * cv_azotea if n == int(num_niveles) else area_construida * cv_tipico
+        cat_str = "AZOTEA" if n == int(num_niveles) else "C" if "C" in categoria else "A/B"
+        
+        peso_total_piso = cm_muerta + cv_piso
+        peso_sismico = cm_muerta + (porcentaje_sismo * cv_piso)
+        
+        data_pesos.append({"Nivel": n, "CM": cm_muerta, "CV": cv_piso, "Categoria": cat_str, "%CV": f"{int(porcentaje_sismo*100)}%", "Peso Total": peso_total_piso, "Peso Sismico": peso_sismico})
+
+    st.dataframe(pd.DataFrame(data_cm).style.format({'Peso Total (t)': '{:.2f}', 'Px': '{:.2f}', 'Py': '{:.2f}', 'CMx': '{:.2f}', 'CMy': '{:.2f}'}), width="stretch", hide_index=True)
+
+    st.markdown("---")
+    st.subheader("3) Pesos Totales y Peso Sismico por Nivel")
+    
+    df_pesos = pd.DataFrame(data_pesos)
+    st.dataframe(df_pesos.style.format({'CM': '{:.2f}', 'CV': '{:.2f}', 'Peso Total': '{:.2f}', 'Peso Sismico': '{:.2f}'}), width="stretch", hide_index=True)
+    
+    st.success(f"**PESO SISMICO TOTAL DE LA EDIFICACION:** {df_pesos['Peso Sismico'].sum():,.2f} toneladas")
